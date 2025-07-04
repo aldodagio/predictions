@@ -29,53 +29,36 @@ if __name__ == '__main__':
     SELECT
         concat(first_name, ' ', last_name) as player_name,
         g.season_id,
-        SUM(passing_attempts) as total_pass_atts,
-        SUM(passing_completions) as total_pass_comps,
-        SUM(passing_yards) as total_pass_yards,
-        SUM(passing_touchdowns) as total_pass_tds,
-        SUM(rushing_attempts) as total_rush_atts,
-        SUM(rushing_yards) as total_rush_yards,
-        SUM(rushing_touchdowns) as total_rush_tds,
-        SUM(receptions) as total_recs,
-        SUM(receiving_yards) as total_rec_yards,
-        SUM(receiving_touchdowns) as total_rec_tds,
-        SUM(fumbles) as total_fumbles,
-        SUM(interceptions) as total_ints
+        SUM(extra_point_attempts) total_extra_point_attempts,
+        SUM(extra_points_made) total_extra_points_made,
+        SUM(field_goal_attempts) total_field_goal_attempts,
+        SUM(field_goals_made) total_field_goals_made,
+        SUM(fifty_yard_field_goals_made) total_fifty_yard_field_goals_made
     FROM player
         INNER JOIN stats s on player.id = s.player_id
         INNER JOIN game g on g.game_id = s.game_id
-        INNER JOIN passing p on p.pass_id = s.pass_id
-        INNER JOIN receiving r on s.reception_id = r.reception_id
-        INNER JOIN rushing r2 on r2.rush_id = s.rush_id
-    WHERE position = 'Running Back'
+        INNER JOIN kicking k on s.kicker_id = k.kicker_id
+    WHERE position = 'Kicker'
     AND g.season_id = 15
     GROUP BY first_name, last_name, player.id, g.season_id
     """
+    recent_season_data = pd.read_sql(recent_season_query, engine)
     # Load and preprocess the training data from the PostgreSQL database
     train_query = """
     SELECT
         concat(first_name, ' ', last_name) as player_name,
         g.season_id,
-        SUM(total_points) as season_points,
-        SUM(passing_attempts) as total_pass_atts,
-        SUM(passing_completions) as total_pass_comps,
-        SUM(passing_yards) as total_pass_yards,
-        SUM(passing_touchdowns) as total_pass_tds,
-        SUM(rushing_attempts) as total_rush_atts,
-        SUM(rushing_yards) as total_rush_yards,
-        SUM(rushing_touchdowns) as total_rush_tds,
-        SUM(receptions) as total_recs,
-        SUM(receiving_yards) as total_rec_yards,
-        SUM(receiving_touchdowns) as total_rec_tds,
-        SUM(fumbles) as total_fumbles,
-        SUM(interceptions) as total_ints
+        SUM(extra_point_attempts) total_extra_point_attempts,
+        SUM(extra_points_made) total_extra_points_made,
+        SUM(field_goal_attempts) total_field_goal_attempts,
+        SUM(field_goals_made) total_field_goals_made,
+        SUM(fifty_yard_field_goals_made) total_fifty_yard_field_goals_made,
+        SUM(total_points) as season_points
     FROM player
         INNER JOIN stats s on player.id = s.player_id
         INNER JOIN game g on g.game_id = s.game_id
-        INNER JOIN passing p on p.pass_id = s.pass_id
-        INNER JOIN receiving r on s.reception_id = r.reception_id
-        INNER JOIN rushing r2 on r2.rush_id = s.rush_id
-    WHERE position = 'Running Back'
+        INNER JOIN kicking k on s.kicker_id = k.kicker_id
+    WHERE position = 'Kicker'
     AND g.season_id != 15
     GROUP BY first_name, last_name, player.id, g.season_id
     ORDER BY season_points DESC
@@ -142,5 +125,5 @@ if __name__ == '__main__':
     # Save the predictions DataFrame to the PostgreSQL database
     submission_df = pd.DataFrame(
         {'predicted_stats': predictions_df['predicted_stats'], 'player_name': predictions_df['player_name']})
-    submission_df.to_sql('running_back_predictions_2025', engine, if_exists='replace', index=False)
+    submission_df.to_sql('kicker_predictions_2025', engine, if_exists='replace', index=False)
 
