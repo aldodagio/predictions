@@ -545,15 +545,17 @@ def train_rookie_wr_model(df):
 def rookie_wr_query():
     query = """
     WITH drafted_wr AS (
-    SELECT
-        nd.player_id,
-        nd.season_id AS rookie_season,
-        nd.draft_round,
-        nd.draft_pick
-    FROM fantasyfootball.nfl_draft nd
-    JOIN fantasyfootball.player p
-        ON p.id = nd.player_id
-    WHERE p.position = 'Wide Receiver'
+        SELECT
+            nd.player_id,
+            p.first_name,
+            p.last_name,
+            nd.season_id AS rookie_season,
+            nd.draft_round,
+            nd.draft_pick
+        FROM fantasyfootball.nfl_draft nd
+        JOIN fantasyfootball.player p
+            ON p.id = nd.player_id
+        WHERE p.position = 'Wide Receiver'
     ),
     
     rookie_nfl AS (
@@ -585,6 +587,8 @@ def rookie_wr_query():
     
     SELECT
         d.player_id,
+        d.first_name,
+        d.last_name,
         d.rookie_season,
     
         -- Draft features
@@ -599,17 +603,22 @@ def rookie_wr_query():
         c.total_yards::float / NULLIF(c.total_receptions,0) AS yards_per_reception,
     
         -- TARGET
-        CASE WHEN r.games_played > 0
-             THEN r.total_points::float / r.games_played
-             ELSE NULL END AS rookie_fantasy_ppg
+        CASE 
+            WHEN r.games_played > 0
+            THEN r.total_points::float / r.games_played
+            ELSE NULL 
+        END AS rookie_fantasy_ppg
     
     FROM drafted_wr d
+    
     LEFT JOIN rookie_nfl r
       ON r.player_id = d.player_id
      AND r.season_id = d.rookie_season
     
     LEFT JOIN college_agg c
-      ON c.college_player_id = d.player_id;  -- ideally mapped properly
+      ON c.college_player_id = d.player_id
+    
+    ORDER BY d.rookie_season, d.draft_round, d.draft_pick;
     """
     return pd.read_sql(query, engine)
 
@@ -634,7 +643,7 @@ if __name__ == "__main__":
 
     # 5️⃣ Rank
     print(
-        incoming[["player_id", "predicted_ppg"]]
+        incoming[["first_name", "last_name", "predicted_ppg"]]
         .sort_values("predicted_ppg", ascending=False)
     )
     # rb_df = rb_query()
