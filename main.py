@@ -1,9 +1,17 @@
 import pandas as pd
 from sqlalchemy import create_engine
-from sklearn.metrics import mean_squared_error
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import (
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+    ExtraTreesRegressor,
+    GradientBoostingRegressor
+)
+
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
 
 # -----------------------------
 # DB CONNECTION
@@ -31,12 +39,662 @@ QUANTILES = [0.25, 0.50, 0.75]
 # 🔑 NEW TARGET: next-season fantasy PPG
 TARGET = "next_season_fantasy_ppg"
 
-TRAIN_CUTOFF = 12
-VAL_SEASON = 13
-TEST_SEASON = 14
-PREDICT_SEASON = 16
+TRAIN_CUTOFF = 13
+VAL_SEASON = 14
+TEST_SEASON = 15
+PREDICT_SEASON = 17
 
+def spearman_rank_correlation(y_true, y_pred):
+    """
+    Measures how well the predicted ordering matches the actual ordering.
 
+    1.0  = perfect ranking
+    0.0  = no ranking relationship
+    -1.0 = completely reversed ranking
+    """
+
+    actual_ranks = pd.Series(y_true).rank(
+        ascending=False,
+        method="average"
+    )
+
+    predicted_ranks = pd.Series(y_pred).rank(
+        ascending=False,
+        method="average"
+    )
+
+    correlation = actual_ranks.corr(
+        predicted_ranks,
+        method="pearson"
+    )
+
+    if pd.isna(correlation):
+        return 0.0
+
+    return correlation
+
+def top_n_hit_rate(y_true, y_pred, top_n):
+    """
+    What percentage of the actual top-N players
+    did the model correctly identify as top-N?
+    """
+
+    results = pd.DataFrame({
+        "actual": np.asarray(y_true),
+        "predicted": np.asarray(y_pred)
+    })
+
+    top_n = min(top_n, len(results))
+
+    if top_n == 0:
+        return 0.0
+
+    actual_top = set(
+        results.nlargest(top_n, "actual").index
+    )
+
+    predicted_top = set(
+        results.nlargest(top_n, "predicted").index
+    )
+
+    correct = len(actual_top & predicted_top)
+
+    return correct / top_n
+
+def save_predictions(df, table_name):
+
+    df.to_sql(
+        table_name,
+        engine,
+        schema="fantasyfootball",
+        if_exists="replace",
+        index=False
+    )
+
+def rookie_receiver_query(position):
+    query = f"""
+    WITH drafted_receivers AS (
+        SELECT
+            nd.player_id AS nfl_player_id,
+            cp.id AS college_player_id,
+
+            p.first_name,
+            p.last_name,
+
+            nd.season_id AS rookie_season,
+            nd.draft_round,
+            nd.draft_pick
+
+        FROM fantasyfootball.nfl_draft nd
+
+        JOIN fantasyfootball.player p
+            ON p.id = nd.player_id
+
+        JOIN fantasyfootball.college_player cp
+            ON LOWER(TRIM(cp.first_name)) = LOWER(TRIM(p.first_name))
+           AND LOWER(TRIM(cp.last_name)) = LOWER(TRIM(p.last_name))
+
+        WHERE p.position = '{position}'
+    ),
+
+    rookie_nfl AS (
+        SELECT
+            s.player_id,
+            g.season_id,
+
+            COUNT(DISTINCT g.game_id) AS games_played,
+            SUM(s.total_points) AS total_points
+
+        FROM fantasyfootball.stats s
+
+        JOIN fantasyfootball.game g
+            ON g.game_id = s.game_id
+
+        GROUP BY
+            s.player_id,
+            g.season_id
+    ),
+
+    college_agg AS (
+        SELECT
+            cp.id AS college_player_id,
+
+            COALESCE(
+                MAX(rec.games_played),
+                MAX(rush.games_played),
+                0
+            ) AS college_games,
+
+            COALESCE(SUM(rec.receptions), 0) AS receptions,
+            COALESCE(SUM(rec.receiving_yards), 0) AS rec_yards,
+            COALESCE(SUM(rec.receiving_touchdowns), 0) AS rec_tds,
+
+            COALESCE(SUM(rush.rushing_attempts), 0) AS rush_atts,
+            COALESCE(SUM(rush.rushing_yards), 0) AS rush_yards,
+            COALESCE(SUM(rush.rushing_touchdowns), 0) AS rush_tds
+
+        FROM fantasyfootball.college_player cp
+
+        JOIN fantasyfootball.college_stats cs
+            ON cs.player_id = cp.id
+
+        LEFT JOIN fantasyfootball.college_receiving rec
+            ON cs.reception_id = rec.reception_id
+
+        LEFT JOIN fantasyfootball.college_rushing rush
+            ON cs.rush_id = rush.rush_id
+
+        GROUP BY cp.id
+    )
+
+    SELECT
+        d.nfl_player_id AS player_id,
+        d.college_player_id,
+
+        d.first_name,
+        d.last_name,
+
+        d.rookie_season,
+        d.draft_round,
+        d.draft_pick,
+
+        c.college_games,
+
+        c.receptions::float
+            / NULLIF(c.college_games, 0)
+            AS receptions_pg,
+
+        c.rec_yards::float
+            / NULLIF(c.college_games, 0)
+            AS receiving_yards_pg,
+
+        c.rec_tds::float
+            / NULLIF(c.college_games, 0)
+            AS receiving_tds_pg,
+
+        c.rec_yards::float
+            / NULLIF(c.receptions, 0)
+            AS yards_per_reception,
+
+        c.rush_yards::float
+            / NULLIF(c.college_games, 0)
+            AS rush_yards_pg,
+
+        c.rush_tds::float
+            / NULLIF(c.college_games, 0)
+            AS rush_tds_pg,
+
+        c.rush_yards::float
+            / NULLIF(c.rush_atts, 0)
+            AS rush_yards_per_attempt,
+
+        CASE
+            WHEN r.games_played > 0
+            THEN r.total_points::float / r.games_played
+            ELSE NULL
+        END AS rookie_fantasy_ppg
+
+    FROM drafted_receivers d
+
+    LEFT JOIN rookie_nfl r
+        ON r.player_id = d.nfl_player_id
+       AND r.season_id = d.rookie_season
+
+    LEFT JOIN college_agg c
+        ON c.college_player_id = d.college_player_id
+
+    ORDER BY
+        d.rookie_season,
+        d.draft_round,
+        d.draft_pick;
+    """
+
+    return pd.read_sql(query, engine)
+
+# -----------------------------
+# DEFENSE / SPECIAL TEAMS
+# -----------------------------
+def dst_query():
+    query = """
+    WITH season_stats AS (
+        SELECT
+            p.id AS player_id,
+            CONCAT(p.first_name, ' ', p.last_name) AS player_name,
+            g.season_id,
+
+            COUNT(DISTINCT g.game_id) AS games_played,
+
+            COALESCE(SUM(d.sacks), 0) AS sacks,
+            COALESCE(SUM(d.interceptions), 0) AS interceptions,
+            COALESCE(SUM(d.safeties), 0) AS safeties,
+            COALESCE(SUM(d.fumble_recoveries), 0) AS fumble_recoveries,
+            COALESCE(SUM(d.blocked_kicks), 0) AS blocked_kicks,
+            COALESCE(SUM(d.touchdowns), 0) AS touchdowns,
+
+            COALESCE(SUM(d.points_allowed), 0) AS points_allowed,
+            COALESCE(SUM(d.pass_yards_allowed), 0) AS pass_yards_allowed,
+            COALESCE(SUM(d.rush_yards_allowed), 0) AS rush_yards_allowed,
+            COALESCE(SUM(d.total_yards_allowed), 0) AS total_yards_allowed,
+
+            COALESCE(SUM(s.total_points), 0) AS fantasy_points
+
+        FROM fantasyfootball.player p
+
+        JOIN fantasyfootball.stats s
+            ON p.id = s.player_id
+
+        JOIN fantasyfootball.game g
+            ON g.game_id = s.game_id
+
+        JOIN fantasyfootball.defense d
+            ON d.defense_id = s.defense_id
+
+        WHERE p.position = 'Defense/Special Teams'
+          AND g.season_id >= 6
+
+        GROUP BY
+            p.id,
+            p.first_name,
+            p.last_name,
+            g.season_id
+    ),
+
+    base AS (
+        SELECT
+            prev.player_id,
+            prev.player_name,
+            prev.season_id AS feature_season,
+
+            prev.games_played,
+
+            prev.sacks,
+            prev.interceptions,
+            prev.safeties,
+            prev.fumble_recoveries,
+            prev.blocked_kicks,
+            prev.touchdowns,
+
+            prev.points_allowed,
+            prev.pass_yards_allowed,
+            prev.rush_yards_allowed,
+            prev.total_yards_allowed,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.sacks::float / prev.games_played
+                ELSE 0
+            END AS sacks_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.interceptions::float / prev.games_played
+                ELSE 0
+            END AS interceptions_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.fumble_recoveries::float / prev.games_played
+                ELSE 0
+            END AS fumble_recoveries_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN (
+                    prev.interceptions
+                    + prev.fumble_recoveries
+                )::float / prev.games_played
+                ELSE 0
+            END AS takeaways_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.touchdowns::float / prev.games_played
+                ELSE 0
+            END AS touchdowns_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.points_allowed::float / prev.games_played
+                ELSE 0
+            END AS points_allowed_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.pass_yards_allowed::float / prev.games_played
+                ELSE 0
+            END AS pass_yards_allowed_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.rush_yards_allowed::float / prev.games_played
+                ELSE 0
+            END AS rush_yards_allowed_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.total_yards_allowed::float / prev.games_played
+                ELSE 0
+            END AS total_yards_allowed_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.fantasy_points::float / prev.games_played
+                ELSE 0
+            END AS fantasy_ppg,
+
+            CASE
+                WHEN next.games_played > 0
+                THEN next.fantasy_points::float / next.games_played
+                ELSE NULL
+            END AS next_season_fantasy_ppg
+
+        FROM season_stats prev
+
+        LEFT JOIN season_stats next
+            ON next.player_id = prev.player_id
+           AND next.season_id = prev.season_id + 1
+    )
+
+    SELECT
+        b.*,
+
+        AVG(b.fantasy_ppg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS fantasy_ppg_2yr_avg,
+
+        AVG(b.sacks_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS sacks_pg_2yr_avg,
+
+        AVG(b.takeaways_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS takeaways_pg_2yr_avg,
+
+        AVG(b.points_allowed_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS points_allowed_pg_2yr_avg,
+
+        AVG(b.total_yards_allowed_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS total_yards_allowed_pg_2yr_avg,
+
+        AVG(b.games_played) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS games_played_2yr_avg,
+
+        b.fantasy_ppg
+        - LAG(b.fantasy_ppg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS fantasy_ppg_delta,
+
+        b.sacks_pg
+        - LAG(b.sacks_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS sacks_pg_delta,
+
+        b.takeaways_pg
+        - LAG(b.takeaways_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS takeaways_pg_delta,
+
+        b.points_allowed_pg
+        - LAG(b.points_allowed_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS points_allowed_pg_delta,
+
+        b.total_yards_allowed_pg
+        - LAG(b.total_yards_allowed_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS total_yards_allowed_pg_delta
+
+    FROM base b;
+    """
+
+    return pd.read_sql(query, engine)
+
+def dst_features():
+    return [
+        "games_played",
+
+        "sacks",
+        "interceptions",
+        "safeties",
+        "fumble_recoveries",
+        "blocked_kicks",
+        "touchdowns",
+
+        "points_allowed",
+        "pass_yards_allowed",
+        "rush_yards_allowed",
+        "total_yards_allowed",
+
+        "sacks_pg",
+        "interceptions_pg",
+        "fumble_recoveries_pg",
+        "takeaways_pg",
+        "touchdowns_pg",
+
+        "points_allowed_pg",
+        "pass_yards_allowed_pg",
+        "rush_yards_allowed_pg",
+        "total_yards_allowed_pg",
+
+        "fantasy_ppg",
+
+        "fantasy_ppg_2yr_avg",
+        "sacks_pg_2yr_avg",
+        "takeaways_pg_2yr_avg",
+        "points_allowed_pg_2yr_avg",
+        "total_yards_allowed_pg_2yr_avg",
+        "games_played_2yr_avg",
+
+        "fantasy_ppg_delta",
+        "sacks_pg_delta",
+        "takeaways_pg_delta",
+        "points_allowed_pg_delta",
+        "total_yards_allowed_pg_delta",
+    ]
+
+# -----------------------------
+# KICKER
+# -----------------------------
+def k_query():
+    query = """
+    WITH season_stats AS (
+        SELECT
+            p.id AS player_id,
+            CONCAT(p.first_name, ' ', p.last_name) AS player_name,
+            g.season_id,
+
+            COUNT(DISTINCT g.game_id) AS games_played,
+
+            COALESCE(SUM(k.extra_point_attempts), 0) AS xp_attempts,
+            COALESCE(SUM(k.extra_points_made), 0) AS xp_made,
+
+            COALESCE(SUM(k.field_goal_attempts), 0) AS fg_attempts,
+            COALESCE(SUM(k.field_goals_made), 0) AS fg_made,
+
+            COALESCE(
+                SUM(k.fifty_yard_field_goals_made),
+                0
+            ) AS fg_50_made,
+
+            COALESCE(SUM(s.total_points), 0) AS fantasy_points
+
+        FROM fantasyfootball.player p
+
+        JOIN fantasyfootball.stats s
+            ON p.id = s.player_id
+
+        JOIN fantasyfootball.game g
+            ON g.game_id = s.game_id
+
+        JOIN fantasyfootball.kicking k
+            ON k.kicker_id = s.kicker_id
+
+        WHERE p.position = 'Kicker'
+          AND g.season_id >= 6
+
+        GROUP BY
+            p.id,
+            p.first_name,
+            p.last_name,
+            g.season_id
+    ),
+
+    base AS (
+        SELECT
+            prev.player_id,
+            prev.player_name,
+            prev.season_id AS feature_season,
+
+            prev.games_played,
+
+            prev.xp_attempts,
+            prev.xp_made,
+
+            prev.fg_attempts,
+            prev.fg_made,
+            prev.fg_50_made,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.xp_attempts::float / prev.games_played
+                ELSE 0
+            END AS xp_attempts_pg,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.fg_attempts::float / prev.games_played
+                ELSE 0
+            END AS fg_attempts_pg,
+
+            CASE
+                WHEN prev.xp_attempts > 0
+                THEN prev.xp_made::float / prev.xp_attempts
+                ELSE 0
+            END AS xp_pct,
+
+            CASE
+                WHEN prev.fg_attempts > 0
+                THEN prev.fg_made::float / prev.fg_attempts
+                ELSE 0
+            END AS fg_pct,
+
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.fantasy_points::float / prev.games_played
+                ELSE 0
+            END AS fantasy_ppg,
+
+            CASE
+                WHEN next.games_played > 0
+                THEN next.fantasy_points::float / next.games_played
+                ELSE NULL
+            END AS next_season_fantasy_ppg
+
+        FROM season_stats prev
+
+        LEFT JOIN season_stats next
+            ON next.player_id = prev.player_id
+           AND next.season_id = prev.season_id + 1
+    )
+
+    SELECT
+        b.*,
+
+        AVG(b.fantasy_ppg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS fantasy_ppg_2yr_avg,
+
+        AVG(b.fg_attempts_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS fg_attempts_pg_2yr_avg,
+
+        AVG(b.xp_attempts_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS xp_attempts_pg_2yr_avg,
+
+        AVG(b.games_played) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS games_played_2yr_avg,
+
+        b.fantasy_ppg
+        - LAG(b.fantasy_ppg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS fantasy_ppg_delta,
+
+        b.fg_attempts_pg
+        - LAG(b.fg_attempts_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS fg_attempts_pg_delta,
+
+        b.xp_attempts_pg
+        - LAG(b.xp_attempts_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS xp_attempts_pg_delta
+
+    FROM base b;
+    """
+
+    return pd.read_sql(query, engine)
+
+def k_features():
+    return [
+        "games_played",
+
+        "xp_attempts",
+        "xp_made",
+
+        "fg_attempts",
+        "fg_made",
+        "fg_50_made",
+
+        "xp_attempts_pg",
+        "fg_attempts_pg",
+
+        "xp_pct",
+        "fg_pct",
+
+        "fantasy_ppg",
+
+        "fantasy_ppg_2yr_avg",
+        "fg_attempts_pg_2yr_avg",
+        "xp_attempts_pg_2yr_avg",
+        "games_played_2yr_avg",
+
+        "fantasy_ppg_delta",
+        "fg_attempts_pg_delta",
+        "xp_attempts_pg_delta",
+    ]
 # -----------------------------
 # RB
 # -----------------------------
@@ -294,7 +952,6 @@ def qb_query():
         LEFT JOIN season_stats next
           ON prev.player_id = next.player_id
          AND next.season_id = prev.season_id + 1
-        WHERE prev.games_played >= 8
     )
     SELECT
         b.season_id AS feature_season,
@@ -408,6 +1065,27 @@ def train_position_model(df, features, position_name):
     print(f"Validation RMSE: {val_rmse:.2f}")
     print(f"Test RMSE: {test_rmse:.2f}")
 
+    print(f"\n{position_name} Permutation Importance (Train + Val):")
+
+    X_all = pd.concat([X_train, X_val])
+    y_all = pd.concat([y_train, y_val])
+
+    perm = permutation_importance(
+        models[0.50],  # median quantile model
+        X_all,
+        y_all,
+        n_repeats=20,
+        random_state=42,
+        scoring="neg_root_mean_squared_error"
+    )
+
+    importances = pd.DataFrame({
+        "feature": features,
+        "importance": perm.importances_mean
+    }).sort_values("importance", ascending=False)
+
+    print(importances)
+
     return models
 
 
@@ -500,25 +1178,28 @@ def rookie_wr_features():
         "draft_pick",
         "college_games",
         "receptions_pg",
-        "yards_pg",
-        "tds_pg",
+        "receiving_yards_pg",
+        "receiving_tds_pg",
         "yards_per_reception",
+        "rush_yards_pg",
+        "rush_tds_pg",
+        "rush_yards_per_attempt",
     ]
 
-def train_rookie_wr_model(df):
+def train_rookie_model(df, features, label="Rookie"):
     df = df[df["rookie_fantasy_ppg"].notna()].copy()
 
     train = df[df.rookie_season <= 12]
     val   = df[df.rookie_season == 13]
     test  = df[df.rookie_season == 14]
 
-    X_train = train[rookie_wr_features()]
+    X_train = train[features]
     y_train = train["rookie_fantasy_ppg"]
 
-    X_val = val[rookie_wr_features()]
+    X_val = val[features]
     y_val = val["rookie_fantasy_ppg"]
 
-    X_test = test[rookie_wr_features()]
+    X_test = test[features]
     y_test = test["rookie_fantasy_ppg"]
 
     model = HistGradientBoostingRegressor(
@@ -530,21 +1211,80 @@ def train_rookie_wr_model(df):
 
     model.fit(X_train, y_train)
 
+    # -----------------------------
+    # Evaluation
+    # -----------------------------
     val_rmse = mean_squared_error(
-        y_val, model.predict(X_val), squared=False
-    )
-    test_rmse = mean_squared_error(
-        y_test, model.predict(X_test), squared=False
+        y_val,
+        model.predict(X_val),
+        squared=False
     )
 
-    print(f"Rookie WR Validation RMSE: {val_rmse:.2f}")
-    print(f"Rookie WR Test RMSE: {test_rmse:.2f}")
+    test_rmse = mean_squared_error(
+        y_test,
+        model.predict(X_test),
+        squared=False
+    )
+
+    print(f"{label} Validation RMSE: {val_rmse:.2f}")
+    print(f"{label} Test RMSE: {test_rmse:.2f}")
+
+    # -----------------------------
+    # 🔎 Permutation Importance
+    # -----------------------------
+    # -----------------------------
+    # 🔎 Permutation Importance (Train + Val)
+    # -----------------------------
+    print(f"\n{label} Permutation Importance (Train + Val):")
+
+    X_all = pd.concat([X_train, X_val])
+    y_all = pd.concat([y_train, y_val])
+
+    perm = permutation_importance(
+        model,
+        X_all,
+        y_all,
+        n_repeats=20,
+        random_state=42,
+        scoring="neg_root_mean_squared_error"
+    )
+
+    importances = pd.DataFrame({
+        "feature": features,
+        "importance": perm.importances_mean
+    }).sort_values("importance", ascending=False)
+
+    print(importances)
 
     return model
 
 def rookie_wr_query():
+    return rookie_receiver_query("Wide Receiver")
+
+
+def rookie_te_query():
+    return rookie_receiver_query("Tight End")
+
+def rookie_te_features():
+    return rookie_wr_features()
+
+
+def rookie_rb_features():
+    return [
+        "draft_round",
+        "draft_pick",
+        "college_games",
+        "rush_yards_pg",
+        "rush_tds_pg",
+        "rush_yards_per_attempt",
+        "receptions_pg",
+        "receiving_yards_pg",
+        "receiving_tds_pg",
+    ]
+
+def rookie_rb_query():
     query = """
-    WITH drafted_wr AS (
+WITH drafted_rb AS (
         SELECT
             nd.player_id,
             p.first_name,
@@ -555,9 +1295,9 @@ def rookie_wr_query():
         FROM fantasyfootball.nfl_draft nd
         JOIN fantasyfootball.player p
             ON p.id = nd.player_id
-        WHERE p.position = 'Wide Receiver'
+        WHERE p.position = 'Running Back'
     ),
-    
+
     rookie_nfl AS (
         SELECT
             s.player_id,
@@ -569,56 +1309,175 @@ def rookie_wr_query():
             ON g.game_id = s.game_id
         GROUP BY s.player_id, g.season_id
     ),
-    
+
     college_agg AS (
         SELECT
             cp.id AS college_player_id,
-            SUM(cr.games_played) AS college_games,
-            SUM(cr.receptions) AS total_receptions,
-            SUM(cr.receiving_yards) AS total_yards,
-            SUM(cr.receiving_touchdowns) AS total_tds
+            
+            SUM(rush.games_played) AS college_games,
+            
+            -- Rushing
+            SUM(rush.rushing_attempts) AS rush_atts,
+            SUM(rush.rushing_yards) AS rush_yards,
+            SUM(rush.rushing_touchdowns) AS rush_tds,
+            
+            -- Receiving
+            SUM(rec.receptions) AS receptions,
+            SUM(rec.receiving_yards) AS rec_yards,
+            SUM(rec.receiving_touchdowns) AS rec_tds
+            
         FROM fantasyfootball.college_player cp
         JOIN fantasyfootball.college_stats cs
             ON cs.player_id = cp.id
-        JOIN fantasyfootball.college_receiving cr
-            ON cs.reception_id = cr.reception_id
+        LEFT JOIN fantasyfootball.college_rushing rush
+            ON cs.rush_id = rush.rush_id
+        LEFT JOIN fantasyfootball.college_receiving rec
+            ON cs.reception_id = rec.reception_id
         GROUP BY cp.id
     )
-    
+
     SELECT
         d.player_id,
         d.first_name,
         d.last_name,
         d.rookie_season,
-    
-        -- Draft features
         d.draft_round,
         d.draft_pick,
-    
-        -- College features
+
         c.college_games,
-        c.total_receptions::float / NULLIF(c.college_games,0) AS receptions_pg,
-        c.total_yards::float / NULLIF(c.college_games,0) AS yards_pg,
-        c.total_tds::float / NULLIF(c.college_games,0) AS tds_pg,
-        c.total_yards::float / NULLIF(c.total_receptions,0) AS yards_per_reception,
-    
-        -- TARGET
+
+        -- Rushing per game
+        c.rush_yards::float / NULLIF(c.college_games,0) AS rush_yards_pg,
+        c.rush_tds::float / NULLIF(c.college_games,0) AS rush_tds_pg,
+        c.rush_yards::float / NULLIF(c.rush_atts,0) AS rush_yards_per_attempt,
+
+        -- Receiving per game
+        c.receptions::float / NULLIF(c.college_games,0) AS receptions_pg,
+        c.rec_yards::float / NULLIF(c.college_games,0) AS receiving_yards_pg,
+        c.rec_tds::float / NULLIF(c.college_games,0) AS receiving_tds_pg,
+
         CASE 
             WHEN r.games_played > 0
             THEN r.total_points::float / r.games_played
-            ELSE NULL 
+            ELSE NULL
         END AS rookie_fantasy_ppg
-    
-    FROM drafted_wr d
-    
+
+    FROM drafted_rb d
     LEFT JOIN rookie_nfl r
-      ON r.player_id = d.player_id
-     AND r.season_id = d.rookie_season
-    
+        ON r.player_id = d.player_id
+       AND r.season_id = d.rookie_season
     LEFT JOIN college_agg c
-      ON c.college_player_id = d.player_id
-    
-    ORDER BY d.rookie_season, d.draft_round, d.draft_pick;
+        ON c.college_player_id = d.player_id
+    """
+    return pd.read_sql(query, engine)
+
+
+def rookie_qb_features():
+    return [
+        "draft_round",
+        "draft_pick",
+        "college_games",
+        "pass_yards_pg",
+        "pass_tds_pg",
+        "completion_pct",
+        "yards_per_attempt",
+        "td_rate",
+        "int_rate",
+        "rush_yards_pg",
+        "rush_tds_pg",
+        "rush_yards_per_attempt",
+    ]
+
+def rookie_qb_query():
+    query = """
+    WITH drafted_qb AS (
+        SELECT
+            nd.player_id,
+            p.first_name,
+            p.last_name,
+            nd.season_id AS rookie_season,
+            nd.draft_round,
+            nd.draft_pick
+        FROM fantasyfootball.nfl_draft nd
+        JOIN fantasyfootball.player p
+            ON p.id = nd.player_id
+        WHERE p.position = 'Quarterback'
+    ),
+
+    rookie_nfl AS (
+        SELECT
+            s.player_id,
+            g.season_id,
+            COUNT(DISTINCT g.game_id) AS games_played,
+            SUM(s.total_points) AS total_points
+        FROM fantasyfootball.stats s
+        JOIN fantasyfootball.game g
+            ON g.game_id = s.game_id
+        GROUP BY s.player_id, g.season_id
+    ),
+
+    college_agg AS (
+        SELECT
+            cp.id AS college_player_id,
+
+            -- Games
+            SUM(pg.games_played) AS college_games,
+
+            -- Passing totals
+            SUM(pg.passing_attempts) AS pass_att,
+            SUM(pg.passing_completions) AS pass_comp,
+            SUM(pg.passing_yards) AS pass_yards,
+            SUM(pg.passing_touchdowns) AS pass_tds,
+            SUM(pg.interceptions) AS interceptions,
+
+            -- Rushing totals
+            SUM(rg.rushing_attempts) AS rush_att,
+            SUM(rg.rushing_yards) AS rush_yards,
+            SUM(rg.rushing_touchdowns) AS rush_tds
+
+        FROM fantasyfootball.college_player cp
+        JOIN fantasyfootball.college_stats cs
+            ON cs.player_id = cp.id
+        LEFT JOIN fantasyfootball.college_passing pg
+            ON cs.pass_id = pg.pass_id
+        LEFT JOIN fantasyfootball.college_rushing rg
+            ON cs.rush_id = rg.rush_id
+
+        GROUP BY cp.id
+    )
+
+    SELECT
+        d.*,
+        c.college_games,
+
+        -- Per-game passing
+        c.pass_yards::float / NULLIF(c.college_games,0) AS pass_yards_pg,
+        c.pass_tds::float / NULLIF(c.college_games,0) AS pass_tds_pg,
+
+        -- Efficiency
+        c.pass_comp::float / NULLIF(c.pass_att,0) AS completion_pct,
+        c.pass_yards::float / NULLIF(c.pass_att,0) AS yards_per_attempt,
+        c.pass_tds::float / NULLIF(c.pass_att,0) AS td_rate,
+        c.interceptions::float / NULLIF(c.pass_att,0) AS int_rate,
+
+        -- Per-game rushing
+        c.rush_yards::float / NULLIF(c.college_games,0) AS rush_yards_pg,
+        c.rush_tds::float / NULLIF(c.college_games,0) AS rush_tds_pg,
+        c.rush_yards::float / NULLIF(c.rush_att,0) AS rush_yards_per_attempt,
+
+        -- Rookie fantasy output
+        CASE 
+            WHEN r.games_played > 0
+            THEN r.total_points::float / r.games_played
+            ELSE NULL
+        END AS rookie_fantasy_ppg
+
+    FROM drafted_qb d
+    LEFT JOIN rookie_nfl r
+        ON r.player_id = d.player_id
+       AND r.season_id = d.rookie_season
+    LEFT JOIN college_agg c
+        ON c.college_player_id = d.player_id   
     """
     return pd.read_sql(query, engine)
 
@@ -626,50 +1485,218 @@ def rookie_wr_query():
 # RUN
 # -----------------------------
 if __name__ == "__main__":
+    print("=" * 80)
+    print("TRAINING VETERAN MODELS")
+    print("=" * 80)
 
-    # 1️⃣ Load rookie dataset
-    df = rookie_wr_query()
+    veteran_configs = [
+        ("QB", qb_query, qb_features),
+        ("RB", rb_query, rb_features),
+        ("WR", wr_query, wr_features),
+        ("TE", te_query, te_features),
+        ("K", k_query, k_features),
+        ("DST", dst_query, dst_features),
+    ]
 
-    # 2️⃣ Train model (pass df in!)
-    rookie_model = train_rookie_wr_model(df)
+    veteran_predictions = {}
 
-    # 3️⃣ Get incoming rookies
-    incoming = df[df.rookie_season == 16].copy()
+    for name, query_fn, feature_fn in veteran_configs:
+        df = query_fn()
+        features = feature_fn()
 
-    # 4️⃣ Predict
-    incoming["predicted_ppg"] = rookie_model.predict(
-        incoming[rookie_wr_features()]
-    )
+        models = train_position_model(df, features, name)
 
-    # 5️⃣ Rank
-    print(
-        incoming[["first_name", "last_name", "predicted_ppg"]]
-        .sort_values("predicted_ppg", ascending=False)
-    )
-    # rb_df = rb_query()
-    # rb_models = train_position_model(rb_df, rb_features(), "Running Back")
-    #
-    # wr_df = wr_query()
-    # wr_models = train_position_model(wr_df, wr_features(), "Wide Receiver")
-    #
-    # te_df = te_query()
-    # te_models = train_position_model(te_df, te_features(), "Tight End")
-    #
-    # qb_df = qb_query()
-    # qb_models = train_position_model(qb_df, qb_features(), "Quarterback")
-    #
-    # # Print rankings
-    # print_top_50(rb_df, rb_models, rb_features(), "Running Back")
-    # print_top_50(wr_df, wr_models, wr_features(), "Wide Receiver")
-    # print_top_50(te_df, te_models, te_features(), "Tight End")
-    # print_top_50(qb_df, qb_models, qb_features(), "Quarterback")
-    #
-    # current_week = 3
-    # df_weekly = rb_weekly_query()  # or combine RB, WR, TE, QB into one df
-    #
-    # # Example for RB
-    # weekly_model, feature_cols = train_weekly_position_model(df_weekly, 'Running Back')
-    # week_feats = get_week_features(df_weekly, current_week, 'Running Back')
-    # week_preds = predict_week(weekly_model, feature_cols, week_feats)
-    # print(week_preds.sort_values('pred_points', ascending=False).head(50))
+        predict_df = df[df.feature_season == PREDICT_SEASON - 1].copy()
 
+        predict_df["predicted_ppg"] = models[0.50].predict(
+            predict_df[features]
+        )
+
+        predict_df["projection"] = (
+                predict_df["predicted_ppg"] * 17
+        )
+
+        veteran_predictions[name] = (
+            predict_df[
+                ["player_id", "player_name", "projection"]
+            ]
+            .rename(columns={
+                "projection": "predicted_stats"
+            })
+            .assign(is_rookie=False)
+            .sort_values("predicted_stats", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        print()
+        print(veteran_predictions[name].head(50))
+
+    print()
+    print("=" * 80)
+    print("TRAINING ROOKIE MODELS")
+    print("=" * 80)
+
+    rookie_configs = [
+        ("QB", rookie_qb_query, rookie_qb_features),
+        ("RB", rookie_rb_query, rookie_rb_features),
+        ("WR", rookie_wr_query, rookie_wr_features),
+        ("TE", rookie_te_query, rookie_te_features),
+    ]
+
+    rookie_predictions = {}
+
+    for name, query_fn, feature_fn in rookie_configs:
+        df = query_fn()
+        features = feature_fn()
+
+        model = train_rookie_model(df, features, f"Rookie {name}")
+
+        # Incoming rookies
+        rookies = df[df.rookie_season == PREDICT_SEASON].copy()
+
+        rookies["predicted_ppg"] = model.predict(
+            rookies[features]
+        )
+
+        rookies["projection"] = (
+                rookies["predicted_ppg"] * 17
+        )
+
+        rookies["player_name"] = (
+                rookies["first_name"] + " " + rookies["last_name"]
+        )
+
+        rookie_predictions[name] = (
+            rookies[
+                ["player_id", "player_name", "projection"]
+            ]
+            .rename(columns={
+                "projection": "predicted_stats"
+            })
+            .assign(is_rookie=True)
+            .sort_values("predicted_stats", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        print()
+        print(rookie_predictions[name].head(25))
+
+    print()
+    print("=" * 80)
+    print("COMBINED RANKINGS")
+    print("=" * 80)
+
+    combined_predictions = {}
+
+    for position, veteran_df in veteran_predictions.items():
+        rookie_df = rookie_predictions.get(
+            position,
+            pd.DataFrame(columns=veteran_df.columns)
+        )
+
+        combined = pd.concat(
+            [veteran_df, rookie_df],
+            ignore_index=True
+        )
+
+        combined = (
+            combined
+            .sort_values("predicted_stats", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        combined_predictions[position] = combined
+
+        print(f"\n{position} Top 50")
+        print(combined.head(50))
+
+    # # Save veteran-only predictions
+    # save_predictions(
+    #     veteran_predictions["QB"],
+    #     "quarterback_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     veteran_predictions["RB"],
+    #     "running_back_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     veteran_predictions["WR"],
+    #     "wide_receiver_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     veteran_predictions["TE"],
+    #     "tight_end_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     veteran_predictions["K"],
+    #     "kicker_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     veteran_predictions["DST"],
+    #     "defense_predictions_2026"
+    # )
+    #
+    # # Save rookie-only predictions
+    # save_predictions(
+    #     rookie_predictions["QB"],
+    #     "rookie_quarterback_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     rookie_predictions["RB"],
+    #     "rookie_running_back_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     rookie_predictions["WR"],
+    #     "rookie_wide_receiver_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     rookie_predictions["TE"],
+    #     "rookie_tight_end_predictions_2026"
+    # )
+    #
+    # # Save combined position predictions
+    # save_predictions(
+    #     combined_predictions["QB"],
+    #     "all_qb_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     combined_predictions["RB"],
+    #     "all_rb_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     combined_predictions["WR"],
+    #     "all_wr_predictions_2026"
+    # )
+    #
+    # save_predictions(
+    #     combined_predictions["TE"],
+    #     "all_te_predictions_2026"
+    # )
+    #
+    # # Save every position into one table
+    # all_prediction_frames = []
+    #
+    # for position, position_df in combined_predictions.items():
+    #     position_df = position_df.copy()
+    #     position_df["position"] = position
+    #     all_prediction_frames.append(position_df)
+    #
+    # all_predictions = pd.concat(
+    #     all_prediction_frames,
+    #     ignore_index=True
+    # )
+    #
+    # save_predictions(
+    #     all_predictions,
+    #     "all_predictions_2026"
+    # )
