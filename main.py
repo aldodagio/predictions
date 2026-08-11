@@ -6,7 +6,7 @@ from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor
 )
-
+import numpy as np
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -43,6 +43,94 @@ TRAIN_CUTOFF = 13
 VAL_SEASON = 14
 TEST_SEASON = 15
 PREDICT_SEASON = 17
+
+TOP_N_BY_POSITION = {
+    "QB": 12,
+    "RB": 24,
+    "WR": 24,
+    "TE": 12,
+    "K": 12,
+    "DST": 12,
+}
+
+
+def get_candidate_models():
+    return {
+        "HistGradientBoosting": Pipeline([
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            ),
+            (
+                "model",
+                HistGradientBoostingRegressor(
+                    loss="squared_error",
+                    max_iter=300,
+                    learning_rate=0.05,
+                    max_leaf_nodes=15,
+                    min_samples_leaf=10,
+                    l2_regularization=0.1,
+                    random_state=42
+                )
+            )
+        ]),
+
+        "RandomForest": Pipeline([
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            ),
+            (
+                "model",
+                RandomForestRegressor(
+                    n_estimators=500,
+                    max_depth=None,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    max_features=0.8,
+                    random_state=42,
+                    n_jobs=-1
+                )
+            )
+        ]),
+
+        "ExtraTrees": Pipeline([
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            ),
+            (
+                "model",
+                ExtraTreesRegressor(
+                    n_estimators=500,
+                    max_depth=None,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    max_features=0.8,
+                    random_state=42,
+                    n_jobs=-1
+                )
+            )
+        ]),
+
+        "GradientBoosting": Pipeline([
+            (
+                "imputer",
+                SimpleImputer(strategy="median")
+            ),
+            (
+                "model",
+                GradientBoostingRegressor(
+                    n_estimators=300,
+                    learning_rate=0.03,
+                    max_depth=3,
+                    min_samples_leaf=5,
+                    loss="huber",
+                    random_state=42
+                )
+            )
+        ])
+    }
 
 def spearman_rank_correlation(y_true, y_pred):
     """
@@ -100,6 +188,32 @@ def top_n_hit_rate(y_true, y_pred, top_n):
     correct = len(actual_top & predicted_top)
 
     return correct / top_n
+
+def mean_rank_error(y_true, y_pred):
+    """
+    Average number of ranking positions the prediction missed by.
+    Lower is better.
+    """
+
+    results = pd.DataFrame({
+        "actual": np.asarray(y_true),
+        "predicted": np.asarray(y_pred)
+    })
+
+    results["actual_rank"] = (
+        results["actual"]
+        .rank(ascending=False, method="average")
+    )
+
+    results["predicted_rank"] = (
+        results["predicted"]
+        .rank(ascending=False, method="average")
+    )
+
+    return (
+        results["actual_rank"] -
+        results["predicted_rank"]
+    ).abs().mean()
 
 def save_predictions(df, table_name):
 
@@ -819,6 +933,7 @@ def wr_query(position="Wide Receiver"):
             p.id AS player_id,
             CONCAT(p.first_name, ' ', p.last_name) AS player_name,
             g.season_id,
+
             COUNT(DISTINCT g.game_id) AS games_played,
 
             SUM(rec.receptions) AS receptions,
@@ -826,14 +941,28 @@ def wr_query(position="Wide Receiver"):
             SUM(rec.receiving_touchdowns) AS rec_tds,
 
             SUM(s.total_points) AS fantasy_points
+
         FROM postgres.fantasyfootball.player p
-        JOIN postgres.fantasyfootball.stats s ON p.id = s.player_id
-        JOIN postgres.fantasyfootball.game g ON g.game_id = s.game_id
-        JOIN postgres.fantasyfootball.receiving rec ON rec.reception_id = s.reception_id
+
+        JOIN postgres.fantasyfootball.stats s
+            ON p.id = s.player_id
+
+        JOIN postgres.fantasyfootball.game g
+            ON g.game_id = s.game_id
+
+        JOIN postgres.fantasyfootball.receiving rec
+            ON rec.reception_id = s.reception_id
+
         WHERE p.position = '{position}'
           AND g.season_id >= 6
-        GROUP BY p.id, p.first_name, p.last_name, g.season_id
+
+        GROUP BY
+            p.id,
+            p.first_name,
+            p.last_name,
+            g.season_id
     ),
+
     base AS (
         SELECT
             prev.player_id,
@@ -845,23 +974,67 @@ def wr_query(position="Wide Receiver"):
             prev.rec_yards,
             prev.rec_tds,
 
-            CASE WHEN prev.games_played > 0
-                 THEN prev.receptions::float / prev.games_played ELSE 0 END AS receptions_pg,
+            -- -------------------------------------------------
+            -- PER-GAME FEATURES
+            -- -------------------------------------------------
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.receptions::float / prev.games_played
+                ELSE 0
+            END AS receptions_pg,
 
-            CASE WHEN prev.games_played > 0
-                 THEN prev.fantasy_points::float / prev.games_played ELSE 0 END AS fantasy_ppg,
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.rec_yards::float / prev.games_played
+                ELSE 0
+            END AS rec_yards_pg,
 
-            CASE WHEN next.games_played > 0
-                 THEN next.fantasy_points::float / next.games_played
-                 ELSE NULL END AS next_season_fantasy_ppg
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.rec_tds::float / prev.games_played
+                ELSE 0
+            END AS rec_tds_pg,
+
+            -- -------------------------------------------------
+            -- EFFICIENCY
+            -- -------------------------------------------------
+            CASE
+                WHEN prev.receptions > 0
+                THEN prev.rec_yards::float / prev.receptions
+                ELSE 0
+            END AS yards_per_reception,
+
+            -- -------------------------------------------------
+            -- FANTASY PRODUCTION
+            -- -------------------------------------------------
+            CASE
+                WHEN prev.games_played > 0
+                THEN prev.fantasy_points::float / prev.games_played
+                ELSE 0
+            END AS fantasy_ppg,
+
+            -- -------------------------------------------------
+            -- TARGET
+            -- -------------------------------------------------
+            CASE
+                WHEN next.games_played > 0
+                THEN next.fantasy_points::float / next.games_played
+                ELSE NULL
+            END AS next_season_fantasy_ppg
+
         FROM season_stats prev
+
         LEFT JOIN season_stats next
-          ON prev.player_id = next.player_id
-         AND next.season_id = prev.season_id + 1
+            ON prev.player_id = next.player_id
+           AND next.season_id = prev.season_id + 1
     )
+
     SELECT
         b.*,
 
+        -- -----------------------------------------------------
+        -- TWO-YEAR AVERAGES
+        -- -----------------------------------------------------
         AVG(b.fantasy_ppg) OVER (
             PARTITION BY b.player_id
             ORDER BY b.feature_season
@@ -874,27 +1047,88 @@ def wr_query(position="Wide Receiver"):
             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
         ) AS receptions_pg_2yr_avg,
 
+        AVG(b.rec_yards_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS rec_yards_pg_2yr_avg,
+
+        AVG(b.rec_tds_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS rec_tds_pg_2yr_avg,
+
+        AVG(b.games_played) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS games_played_2yr_avg,
+
+        -- -----------------------------------------------------
+        -- YEAR-OVER-YEAR TRENDS
+        -- -----------------------------------------------------
         b.fantasy_ppg -
         LAG(b.fantasy_ppg) OVER (
             PARTITION BY b.player_id
             ORDER BY b.feature_season
-        ) AS fantasy_ppg_delta
+        ) AS fantasy_ppg_delta,
+
+        b.receptions_pg -
+        LAG(b.receptions_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS receptions_pg_delta,
+
+        b.rec_yards_pg -
+        LAG(b.rec_yards_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS rec_yards_pg_delta,
+
+        b.rec_tds_pg -
+        LAG(b.rec_tds_pg) OVER (
+            PARTITION BY b.player_id
+            ORDER BY b.feature_season
+        ) AS rec_tds_pg_delta
+
     FROM base b;
     """
+
     return pd.read_sql(query, engine)
 
 
 def wr_features():
     return [
+        # Availability / season volume
         "games_played",
         "receptions",
         "rec_yards",
         "rec_tds",
+
+        # Per-game production
         "receptions_pg",
+        "rec_yards_pg",
+        "rec_tds_pg",
+
+        # Efficiency
+        "yards_per_reception",
+
+        # Fantasy production
         "fantasy_ppg",
+
+        # Historical stability
         "fantasy_ppg_2yr_avg",
         "receptions_pg_2yr_avg",
+        "rec_yards_pg_2yr_avg",
+        "rec_tds_pg_2yr_avg",
+        "games_played_2yr_avg",
+
+        # Trajectory / breakout indicators
         "fantasy_ppg_delta",
+        "receptions_pg_delta",
+        "rec_yards_pg_delta",
+        "rec_tds_pg_delta",
     ]
 
 
@@ -1026,68 +1260,477 @@ def print_top_50(df, models, features, position_name):
 # -----------------------------
 # TRAIN / EVAL
 # -----------------------------
-def train_position_model(df, features, position_name):
-    df = df[df[TARGET].notna()].copy()
+def train_position_model(
+        df,
+        features,
+        position_name,
+        target_col=TARGET
+):
+    """
+    Runs a ranking-first model tournament using walk-forward validation.
 
-    train = df[df.feature_season <= TRAIN_CUTOFF]
-    val = df[df.feature_season == VAL_SEASON]
-    test = df[df.feature_season == TEST_SEASON]
+    Model selection priority:
+        1. Top-N hit rate
+        2. Top-N rank error
+        3. Overall rank correlation
+        4. MAE
 
-    X_train, y_train = train[features], train[TARGET]
-    X_val, y_val = val[features], val[TARGET]
-    X_test, y_test = test[features], test[TARGET]
+    Also compares every position against a simple baseline:
+        next year's ranking = this year's fantasy PPG ranking
 
-    baseline = X_val["fantasy_ppg"]
-    baseline_rmse = mean_squared_error(y_val, baseline, squared=False)
+    TEST_SEASON is kept untouched during model selection.
+    After choosing a winner, the winner is evaluated on TEST_SEASON,
+    then retrained on all available labeled historical data.
+    """
 
-    models = {}
-    for q in QUANTILES:
-        model = HistGradientBoostingRegressor(
-            loss="quantile",
-            quantile=q,
-            max_depth=5,
-            learning_rate=0.05,
-            max_iter=300,
-            random_state=42,
+    print()
+    print("=" * 80)
+    print(f"{position_name} MODEL TOURNAMENT")
+    print("=" * 80)
+
+    # ---------------------------------------------------------
+    # Only rows with a known next-season result can be used
+    # for training / evaluation.
+    # ---------------------------------------------------------
+    labeled_df = df[
+        df[target_col].notna()
+    ].copy()
+
+    candidate_models = get_candidate_models()
+
+    top_n = TOP_N_BY_POSITION.get(
+        position_name,
+        12
+    )
+
+    # ---------------------------------------------------------
+    # Determine available walk-forward validation seasons.
+    #
+    # TEST_SEASON remains untouched.
+    # ---------------------------------------------------------
+    available_seasons = sorted(
+        labeled_df["feature_season"]
+        .dropna()
+        .unique()
+    )
+
+    validation_seasons = [
+        season
+        for season in available_seasons
+        if season < TEST_SEASON
+    ]
+
+    # Require several prior seasons before beginning validation.
+    if len(validation_seasons) > 3:
+        validation_seasons = validation_seasons[3:]
+
+    # =========================================================
+    # BASELINE
+    # =========================================================
+    print()
+    print("-" * 80)
+    print("LAST YEAR PPG BASELINE")
+    print("-" * 80)
+
+    baseline_fold_results = []
+
+    for validation_season in validation_seasons:
+
+        validation = labeled_df[
+            labeled_df.feature_season == validation_season
+        ].copy()
+
+        if validation.empty:
+            continue
+
+        y_val = (
+            validation[target_col]
+            .reset_index(drop=True)
         )
-        model.fit(X_train, y_train)
-        models[q] = model
 
-    val_rmse = mean_squared_error(
-        y_val, models[0.50].predict(X_val), squared=False
+        baseline_predictions = (
+            validation["fantasy_ppg"]
+            .reset_index(drop=True)
+            .values
+        )
+
+        metrics = evaluate_predictions(
+            y_val,
+            baseline_predictions,
+            top_n
+        )
+
+        metrics["season"] = validation_season
+
+        baseline_fold_results.append(metrics)
+
+        print(
+            f"Season {validation_season}: "
+            f"Rank Corr={metrics['rank_correlation']:.3f} | "
+            f"Top {top_n}={metrics['top_n_hit_rate']:.1%} | "
+            f"Top {top_n} Rank Error={metrics['top_n_rank_error']:.2f} | "
+            f"RMSE={metrics['rmse']:.2f}"
+        )
+
+    baseline_df = pd.DataFrame(
+        baseline_fold_results
     )
-    test_rmse = mean_squared_error(
-        y_test, models[0.50].predict(X_test), squared=False
+
+    if not baseline_df.empty:
+        print()
+        print("BASELINE AVERAGES")
+        print(
+            f"Rank Correlation : "
+            f"{baseline_df['rank_correlation'].mean():.3f}"
+        )
+
+        print(
+            f"Top {top_n} Hit Rate : "
+            f"{baseline_df['top_n_hit_rate'].mean():.1%}"
+        )
+
+        print(
+            f"Top {top_n} Rank Error : "
+            f"{baseline_df['top_n_rank_error'].mean():.2f}"
+        )
+
+        print(
+            f"Mean Rank Error : "
+            f"{baseline_df['mean_rank_error'].mean():.2f}"
+        )
+
+        print(
+            f"RMSE : "
+            f"{baseline_df['rmse'].mean():.2f}"
+        )
+
+        print(
+            f"MAE : "
+            f"{baseline_df['mae'].mean():.2f}"
+        )
+
+    # =========================================================
+    # MODEL TOURNAMENT
+    # =========================================================
+    tournament_results = []
+
+    for model_name, model in candidate_models.items():
+
+        fold_results = []
+
+        print()
+        print("-" * 80)
+        print(model_name)
+        print("-" * 80)
+
+        for validation_season in validation_seasons:
+
+            # -------------------------------------------------
+            # Walk-forward:
+            #
+            # Train only on seasons BEFORE validation season.
+            # -------------------------------------------------
+            train = labeled_df[
+                labeled_df.feature_season < validation_season
+            ].copy()
+
+            validation = labeled_df[
+                labeled_df.feature_season == validation_season
+            ].copy()
+
+            if train.empty or validation.empty:
+                continue
+
+            X_train = train[features]
+            y_train = train[target_col]
+
+            X_val = validation[features]
+
+            y_val = (
+                validation[target_col]
+                .reset_index(drop=True)
+            )
+
+            # -------------------------------------------------
+            # Train / predict
+            # -------------------------------------------------
+            model.fit(
+                X_train,
+                y_train
+            )
+
+            predictions = model.predict(
+                X_val
+            )
+
+            # -------------------------------------------------
+            # Ranking-first evaluation
+            # -------------------------------------------------
+            metrics = evaluate_predictions(
+                y_val,
+                predictions,
+                top_n
+            )
+
+            metrics["season"] = validation_season
+
+            fold_results.append(metrics)
+
+            print(
+                f"Season {validation_season}: "
+                f"Rank Corr={metrics['rank_correlation']:.3f} | "
+                f"Top {top_n}={metrics['top_n_hit_rate']:.1%} | "
+                f"Top {top_n} Rank Error="
+                f"{metrics['top_n_rank_error']:.2f} | "
+                f"Rank Error={metrics['mean_rank_error']:.2f} | "
+                f"RMSE={metrics['rmse']:.2f}"
+            )
+
+        if not fold_results:
+            continue
+
+        fold_df = pd.DataFrame(
+            fold_results
+        )
+
+        tournament_results.append({
+            "model": model_name,
+
+            "avg_top_n_hit_rate":
+                fold_df["top_n_hit_rate"].mean(),
+
+            "avg_top_n_rank_error":
+                fold_df["top_n_rank_error"].mean(),
+
+            "avg_rank_correlation":
+                fold_df["rank_correlation"].mean(),
+
+            "avg_rank_error":
+                fold_df["mean_rank_error"].mean(),
+
+            "avg_rmse":
+                fold_df["rmse"].mean(),
+
+            "avg_mae":
+                fold_df["mae"].mean(),
+
+            "folds":
+                len(fold_df)
+        })
+
+    # =========================================================
+    # TOURNAMENT RESULTS
+    # =========================================================
+    results_df = pd.DataFrame(
+        tournament_results
     )
 
-    print(f"\n{position_name}")
-    print(f"Baseline RMSE: {baseline_rmse:.2f}")
-    print(f"Validation RMSE: {val_rmse:.2f}")
-    print(f"Test RMSE: {test_rmse:.2f}")
+    if results_df.empty:
+        raise ValueError(
+            f"No tournament results generated for "
+            f"{position_name}"
+        )
 
-    print(f"\n{position_name} Permutation Importance (Train + Val):")
-
-    X_all = pd.concat([X_train, X_val])
-    y_all = pd.concat([y_train, y_val])
-
-    perm = permutation_importance(
-        models[0.50],  # median quantile model
-        X_all,
-        y_all,
-        n_repeats=20,
-        random_state=42,
-        scoring="neg_root_mean_squared_error"
+    # ---------------------------------------------------------
+    # Ranking-first winner selection
+    # ---------------------------------------------------------
+    results_df = (
+        results_df
+        .sort_values(
+            by=[
+                "avg_top_n_hit_rate",
+                "avg_top_n_rank_error",
+                "avg_rank_correlation",
+                "avg_mae"
+            ],
+            ascending=[
+                False,
+                True,
+                False,
+                True
+            ]
+        )
+        .reset_index(drop=True)
     )
 
-    importances = pd.DataFrame({
-        "feature": features,
-        "importance": perm.importances_mean
-    }).sort_values("importance", ascending=False)
+    print()
+    print("=" * 80)
+    print(f"{position_name} TOURNAMENT RESULTS")
+    print("=" * 80)
 
-    print(importances)
+    print(
+        results_df[
+            [
+                "model",
+                "avg_top_n_hit_rate",
+                "avg_top_n_rank_error",
+                "avg_rank_correlation",
+                "avg_rank_error",
+                "avg_rmse",
+                "avg_mae",
+                "folds"
+            ]
+        ].to_string(index=False)
+    )
 
-    return models
+    # =========================================================
+    # WINNER
+    # =========================================================
+    winner_name = results_df.iloc[0]["model"]
 
+    print()
+    print(
+        f"🏆 {position_name} WINNER: "
+        f"{winner_name}"
+    )
+
+    # Get a fresh copy of the winning model.
+    winner_model = get_candidate_models()[
+        winner_name
+    ]
+
+    # =========================================================
+    # FINAL UNTOUCHED TEST
+    # =========================================================
+    final_train = labeled_df[
+        labeled_df.feature_season < TEST_SEASON
+    ].copy()
+
+    final_test = labeled_df[
+        labeled_df.feature_season == TEST_SEASON
+    ].copy()
+
+    if not final_test.empty:
+
+        winner_model.fit(
+            final_train[features],
+            final_train[target_col]
+        )
+
+        test_predictions = winner_model.predict(
+            final_test[features]
+        )
+
+        test_y = (
+            final_test[target_col]
+            .reset_index(drop=True)
+        )
+
+        test_metrics = evaluate_predictions(
+            test_y,
+            test_predictions,
+            top_n
+        )
+
+        # -----------------------------------------------------
+        # Baseline on the exact same final test season
+        # -----------------------------------------------------
+        baseline_test_predictions = (
+            final_test["fantasy_ppg"]
+            .reset_index(drop=True)
+            .values
+        )
+
+        baseline_test_metrics = evaluate_predictions(
+            test_y,
+            baseline_test_predictions,
+            top_n
+        )
+
+        print()
+        print("=" * 80)
+        print(
+            f"{position_name} FINAL TEST "
+            f"(Season {TEST_SEASON})"
+        )
+        print("=" * 80)
+
+        print()
+        print("MODEL")
+        print(
+            f"Rank Correlation : "
+            f"{test_metrics['rank_correlation']:.3f}"
+        )
+
+        print(
+            f"Top {top_n} Hit Rate : "
+            f"{test_metrics['top_n_hit_rate']:.1%}"
+        )
+
+        print(
+            f"Top {top_n} Rank Error : "
+            f"{test_metrics['top_n_rank_error']:.2f}"
+        )
+
+        print(
+            f"Mean Rank Error : "
+            f"{test_metrics['mean_rank_error']:.2f}"
+        )
+
+        print(
+            f"RMSE : "
+            f"{test_metrics['rmse']:.2f}"
+        )
+
+        print(
+            f"MAE : "
+            f"{test_metrics['mae']:.2f}"
+        )
+
+        print()
+        print("LAST YEAR PPG BASELINE")
+
+        print(
+            f"Rank Correlation : "
+            f"{baseline_test_metrics['rank_correlation']:.3f}"
+        )
+
+        print(
+            f"Top {top_n} Hit Rate : "
+            f"{baseline_test_metrics['top_n_hit_rate']:.1%}"
+        )
+
+        print(
+            f"Top {top_n} Rank Error : "
+            f"{baseline_test_metrics['top_n_rank_error']:.2f}"
+        )
+
+        print(
+            f"Mean Rank Error : "
+            f"{baseline_test_metrics['mean_rank_error']:.2f}"
+        )
+
+        print(
+            f"RMSE : "
+            f"{baseline_test_metrics['rmse']:.2f}"
+        )
+
+        print(
+            f"MAE : "
+            f"{baseline_test_metrics['mae']:.2f}"
+        )
+
+        # -----------------------------------------------------
+        # Show the mistakes we actually care about.
+        # -----------------------------------------------------
+        print_biggest_ranking_misses(
+            final_test,
+            test_predictions,
+            top_n
+        )
+
+    # =========================================================
+    # FINAL PRODUCTION TRAINING
+    #
+    # Testing is finished.
+    # Train the winner on every completed labeled season.
+    # =========================================================
+    winner_model.fit(
+        labeled_df[features],
+        labeled_df[target_col]
+    )
+
+    return winner_model, results_df
 
 def train_weekly_position_model(df: pd.DataFrame, position: str, target_col='points'):
     """
@@ -1481,6 +2124,156 @@ def rookie_qb_query():
     """
     return pd.read_sql(query, engine)
 
+def evaluate_predictions(
+        y_true,
+        y_pred,
+        top_n
+):
+    return {
+        "rank_correlation": spearman_rank_correlation(
+            y_true,
+            y_pred
+        ),
+
+        "top_n_hit_rate": top_n_hit_rate(
+            y_true,
+            y_pred,
+            top_n
+        ),
+
+        "top_n_rank_error": top_n_rank_error(
+            y_true,
+            y_pred,
+            top_n
+        ),
+
+        "mean_rank_error": mean_rank_error(
+            y_true,
+            y_pred
+        ),
+
+        "rmse": mean_squared_error(
+            y_true,
+            y_pred,
+            squared=False
+        ),
+
+        "mae": mean_absolute_error(
+            y_true,
+            y_pred
+        )
+    }
+
+def top_n_rank_error(y_true, y_pred, top_n):
+    """
+    Average ranking error specifically for players
+    who ACTUALLY finished in the top N.
+
+    Lower is better.
+    """
+
+    results = pd.DataFrame({
+        "actual": np.asarray(y_true),
+        "predicted": np.asarray(y_pred)
+    })
+
+    results["actual_rank"] = (
+        results["actual"]
+        .rank(
+            ascending=False,
+            method="average"
+        )
+    )
+
+    results["predicted_rank"] = (
+        results["predicted"]
+        .rank(
+            ascending=False,
+            method="average"
+        )
+    )
+
+    actual_top_n = results[
+        results["actual_rank"] <= top_n
+    ].copy()
+
+    if actual_top_n.empty:
+        return np.nan
+
+    return (
+        actual_top_n["actual_rank"]
+        - actual_top_n["predicted_rank"]
+    ).abs().mean()
+
+def print_biggest_ranking_misses(
+        test_df,
+        predictions,
+        top_n,
+        limit=15
+):
+    results = test_df[
+        [
+            "player_name",
+            TARGET
+        ]
+    ].copy()
+
+    results["prediction"] = predictions
+
+    results["actual_rank"] = (
+        results[TARGET]
+        .rank(
+            ascending=False,
+            method="min"
+        )
+        .astype(int)
+    )
+
+    results["predicted_rank"] = (
+        results["prediction"]
+        .rank(
+            ascending=False,
+            method="min"
+        )
+        .astype(int)
+    )
+
+    results["rank_error"] = (
+        results["actual_rank"]
+        - results["predicted_rank"]
+    ).abs()
+
+    important_misses = results[
+        results["actual_rank"] <= top_n
+    ]
+
+    important_misses = (
+        important_misses
+        .sort_values(
+            "rank_error",
+            ascending=False
+        )
+        .head(limit)
+    )
+
+    print()
+    print("=" * 80)
+    print(f"BIGGEST TOP {top_n} RANKING MISSES")
+    print("=" * 80)
+
+    print(
+        important_misses[
+            [
+                "player_name",
+                TARGET,
+                "prediction",
+                "actual_rank",
+                "predicted_rank",
+                "rank_error"
+            ]
+        ].to_string(index=False)
+    )
+
 # -----------------------------
 # RUN
 # -----------------------------
@@ -1504,12 +2297,20 @@ if __name__ == "__main__":
         df = query_fn()
         features = feature_fn()
 
-        models = train_position_model(df, features, name)
+        best_model, tournament_results = train_position_model(
+            df,
+            features,
+            name
+        )
 
-        predict_df = df[df.feature_season == PREDICT_SEASON - 1].copy()
+        predict_df = df[
+            df.feature_season == PREDICT_SEASON - 1
+            ].copy()
 
-        predict_df["predicted_ppg"] = models[0.50].predict(
-            predict_df[features]
+        predict_df["predicted_ppg"] = (
+            best_model.predict(
+                predict_df[features]
+            )
         )
 
         predict_df["projection"] = (
@@ -1518,13 +2319,21 @@ if __name__ == "__main__":
 
         veteran_predictions[name] = (
             predict_df[
-                ["player_id", "player_name", "projection"]
+                [
+                    "player_id",
+                    "player_name",
+                    "projection"
+                ]
             ]
-            .rename(columns={
-                "projection": "predicted_stats"
-            })
-            .assign(is_rookie=False)
-            .sort_values("predicted_stats", ascending=False)
+            .rename(
+                columns={
+                    "projection": "predicted_stats"
+                }
+            )
+            .sort_values(
+                "predicted_stats",
+                ascending=False
+            )
             .reset_index(drop=True)
         )
 
